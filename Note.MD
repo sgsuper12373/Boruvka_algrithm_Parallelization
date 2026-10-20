@@ -121,3 +121,10 @@ OMP_PLACES=cores OMP_PROC_BIND=close taskset -c 8-15 ./scripts/run_uminho_tests.
 - Prepare high level version of report and send to anju ma'am by the date 2nd oct and final report by the 6th oct. 
 - Meet on monday (5th oct)
 
+
+
+12-9-2026 
+- Run the Lonestar, Uminho and current omp versions on HPC and create comparision graphs 
+- High level draft for cuda implementation. 
+- Check for Theard divergence, memory coleasing, use of shared memory if possible, if using shared mem the bank conflicts 
+- 

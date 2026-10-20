@@ -17,6 +17,8 @@
 \usepackage{xcolor}
 \usepackage{algorithm}
 \usepackage{algpseudocode}
+% "parallel for" block for the OpenMP algorithms
+\algblockdefx[ParFor]{ParFor}{EndParFor}[1]{\textbf{parallel for} #1 \textbf{do}}{\textbf{end parallel for}}
 \usepackage{listings}
 \usepackage{enumitem}
 \usepackage[colorlinks=true,linkcolor=blue,urlcolor=blue,citecolor=blue]{hyperref}
@@ -122,59 +124,104 @@ The sequential implementation follows the textbook rounds (Algorithm~\ref{alg:se
 
 Union is called with the component representative $c$ instead of the source vertex of the edge. This is correct since both belong to the same set. Since edges are scanned in increasing order of CSR indexes and replaced only on a strictly smaller weight, ties between equal weights are broken by the smallest edge index.
 
-% Algo is taking too much space 
-% \begin{algorithm}[H]
-%   \caption{Sequential Bor\r{u}vka}
-%   \label{alg:sequential}
-%   \begin{algorithmic}[1]
-%     \Require Weighted graph $G$ in CSR format ($nindex$, $nlist$, $eweight$), $n = |V|$
-%     \Ensure Total weight $W$ of the minimum spanning forest
-%     \State $W \gets 0$
-%     \State $currComps \gets n$, \; $prevComps \gets \infty$
-%     \State initialize a DSU with each vertex in its own set
-%     \While{$prevComps \ne currComps$}
-%       \State $prevComps \gets currComps$
-%       \Statex \Comment{Phase 0: flatten component ids and reset}
-%       \For{$u \gets 0$ \textbf{to} $n-1$}
-%         \State $comp[u] \gets \text{DSU.Find}(u)$
-%         \State $cheapest[u] \gets \text{INF}$
-%       \EndFor
-%       \Statex \Comment{Phase 1: cheapest outgoing edge (CSR index) per component}
-%       \For{$u \gets 0$ \textbf{to} $n-1$}
-%         \State $c \gets comp[u]$
-%         \For{$i \gets nindex[u]$ \textbf{to} $nindex[u+1]-1$}
-%           \State $v \gets nlist[i]$
-%           \If{$comp[v] \ne c$ \textbf{and} ($cheapest[c] = \text{INF}$ \textbf{or} $eweight[i] < eweight[cheapest[c]]$)}
-%             \State $cheapest[c] \gets i$
-%           \EndIf
-%         \EndFor
-%       \EndFor
-%       \Statex \Comment{Phase 2: merge each component along its cheapest edge}
-%       \For{$c \gets 0$ \textbf{to} $n-1$}
-%         \If{$cheapest[c] \ne \text{INF}$}
-%           \State $i \gets cheapest[c]$, \; $v \gets nlist[i]$
-%           \If{$\text{DSU.Union}(c, v)$}
-%             \State $W \gets W + eweight[i]$
-%             \State $currComps \gets currComps - 1$
-%           \EndIf
-%         \EndIf
-%       \EndFor
-%     \EndWhile
-%     \State \Return $W$
-%   \end{algorithmic}
-% \end{algorithm}
+\begin{algorithm}[H]
+  \caption{Sequential Bor\r{u}vka}
+  \label{alg:sequential}
+  \begin{algorithmic}[1]
+    \Require Weighted graph $G$ in CSR format ($nindex$, $nlist$, $eweight$), $n = |V|$
+    \Ensure Total weight $W$ of the minimum spanning forest
+    \State $W \gets 0$
+    \State $currComps \gets n$, \; $prevComps \gets \infty$
+    \State initialize a DSU with each vertex in its own set
+    \While{$prevComps \ne currComps$}
+      \State $prevComps \gets currComps$
+      \Statex \Comment{Phase 0: flatten component ids and reset}
+      \For{$u \gets 0$ \textbf{to} $n-1$}
+        \State $comp[u] \gets \text{DSU.Find}(u)$
+        \State $cheapest[u] \gets \text{INF}$
+      \EndFor
+      \Statex \Comment{Phase 1: cheapest outgoing edge (CSR index) per component}
+      \For{$u \gets 0$ \textbf{to} $n-1$}
+        \State $c \gets comp[u]$
+        \For{$i \gets nindex[u]$ \textbf{to} $nindex[u+1]-1$}
+          \State $v \gets nlist[i]$
+          \If{$comp[v] \ne c$ \textbf{and} ($cheapest[c] = \text{INF}$ \textbf{or} $eweight[i] < eweight[cheapest[c]]$)}
+            \State $cheapest[c] \gets i$
+          \EndIf
+        \EndFor
+      \EndFor
+      \Statex \Comment{Phase 2: merge each component along its cheapest edge}
+      \For{$c \gets 0$ \textbf{to} $n-1$}
+        \If{$cheapest[c] \ne \text{INF}$}
+          \State $i \gets cheapest[c]$, \; $v \gets nlist[i]$
+          \If{$\text{DSU.Union}(c, v)$}
+            \State $W \gets W + eweight[i]$
+            \State $currComps \gets currComps - 1$
+          \EndIf
+        \EndIf
+      \EndFor
+    \EndWhile
+    \State \Return $W$
+  \end{algorithmic}
+\end{algorithm}
 
 \subsection*{Bor\r{u}vka-omp}
-Bor\r{u}vka-omp parallelizes each phase of the sequential version with \texttt{\#pragma omp parallel for} constructs. The implicit barrier at the end of each parallel loop separates the phases. The DSU type is again a template parameter. We use \texttt{DSU\_half\_omp}, a thread-safe DSU with path halving, because it performed best among the variants we tested: path halving writes fewer parent pointers per \texttt{find}, which reduces contention due to atomic operations on the shared parent array.
+Bor\r{u}vka-omp (Algorithm~\ref{alg:omp}) parallelizes each phase of the sequential version with \texttt{\#pragma omp parallel for} constructs. The implicit barrier at the end of each parallel loop separates the phases. The DSU type is again a template parameter. We use \texttt{DSU\_half\_omp}, a thread-safe DSU with path halving, because it performed best among the variants we tested (see Reasoning on Results).
 
 \begin{itemize}
   \item \textbf{Phase 0 (flatten and reset)} -- each vertex stores its root in \texttt{comp[u]} and resets \texttt{cheapest[u]}. This loop uses static scheduling with a fixed chunk size.
-  \item \textbf{Phase 1 (cheapest edge)} -- each thread scans the adjacency lists of its vertices. A vertex keeps the minimum over its own edges in a local variable and performs one atomic minimum on \texttt{cheapest[comp[u]]} per vertex instead of one per edge. A vertex whose neighbours all lie in its own component is marked inactive and skipped in later rounds, since components only ever merge. The work per vertex depends on its degree.
+  \item \textbf{Phase 1 (cheapest edge)} -- each thread scans the adjacency lists of its vertices. A vertex keeps the minimum over its own edges in a local variable and performs one atomic minimum on \texttt{cheapest[comp[u]]} per vertex instead of one per edge. A vertex whose neighbours all lie in its own component is marked inactive and skipped in later rounds, since components only ever merge. The work per vertex depends on its degree, so this loop uses dynamic scheduling with chunks of 256 vertices.
   \item \textbf{Phase 2 (merge)} -- each component with a selected edge is united with the component on the other end. The MST weight and the number of merges are accumulated with OpenMP reductions instead of atomic updates on shared counters. The loop exits as soon as one component remains or a round performs no merge.
 \end{itemize}
 
+\begin{algorithm}[H]
+  \caption{Bor\r{u}vka-omp}
+  \label{alg:omp}
+  \begin{algorithmic}[1]
+    \Require Weighted graph $G$ in CSR format ($nindex$, $nlist$, $eweight$), $n = |V|$
+    \Ensure Total weight $W$ of the minimum spanning forest
+    \State $W \gets 0$, \; $comps \gets n$
+    \State initialize a DSU with each vertex in its own set; $active[u] \gets \textbf{true}$ for all $u$
+    \Loop
+      \Statex \Comment{Phase 0: flatten component ids and reset (static schedule)}
+      \ParFor{$u \gets 0$ \textbf{to} $n-1$}
+        \State $comp[u] \gets \text{DSU.Find}(u)$, \; $cheapest[u] \gets \text{INF}$
+      \EndParFor
+      \Statex \Comment{Phase 1: cheapest outgoing edge per component (dynamic schedule)}
+      \ParFor{$u \gets 0$ \textbf{to} $n-1$ \textbf{with} $active[u]$}
+        \State $c \gets comp[u]$, \; $best \gets \text{INF}$
+        \For{$i \gets nindex[u]$ \textbf{to} $nindex[u+1]-1$}
+          \If{$comp[nlist[i]] \ne c$}
+            \State $best \gets \min(best,\ \text{Key}(eweight[i], i))$ \Comment{local minimum}
+          \EndIf
+        \EndFor
+        \If{$best \ne \text{INF}$}
+          \State $\text{AtomicMin}(cheapest[c],\ best)$ \Comment{one atomic per vertex}
+        \Else
+          \State $active[u] \gets \textbf{false}$ \Comment{no outgoing edge, never again}
+        \EndIf
+      \EndParFor
+      \Statex \Comment{Phase 2: merge components (static schedule, reductions on $W_r$, $m$)}
+      \State $W_r \gets 0$, \; $m \gets 0$
+      \ParFor{$c \gets 0$ \textbf{to} $n-1$}
+        \If{$cheapest[c] \ne \text{INF}$}
+          \State $(w, i) \gets \text{Decode}(cheapest[c])$
+          \If{$\text{DSU.Union}(c, nlist[i])$}
+            \State $W_r \gets W_r + w$, \; $m \gets m + 1$
+          \EndIf
+        \EndIf
+      \EndParFor
+      \State $W \gets W + W_r$, \; $comps \gets comps - m$
+      \If{$comps = 1$ \textbf{or} $m = 0$}
+        \State \textbf{break}
+      \EndIf
+    \EndLoop
+    \State \Return $W$
+  \end{algorithmic}
+\end{algorithm}
+
 \subsection*{Bor\r{u}vka-intermediate}
-Bor\r{u}vka-intermediate builds on Bor\r{u}vka-omp, uses \texttt{DSU\_intermediate\_omp}, and makes three changes:
+Bor\r{u}vka-intermediate (Algorithm~\ref{alg:intermediate}) builds on Bor\r{u}vka-omp, uses \texttt{DSU\_intermediate\_omp}, and makes three changes:
 
 \begin{itemize}
   \item \textbf{No separate reset phase} -- \texttt{cheapest} is initialized once before the first round. After that, phase 2 resets each entry to INF right after reading it.
@@ -183,6 +230,54 @@ Bor\r{u}vka-intermediate builds on Bor\r{u}vka-omp, uses \texttt{DSU\_intermedia
 \end{itemize}
 
 The parent array is modified only during the union and compression phases, and each phase ends with an implicit barrier. Therefore, the parent array does not change during minimum edge selection, and \texttt{find} and the same-component check need no atomic reads there. OpenMP tasks were tried for \texttt{compress\_tree()} and rejected: recursion depth is a risk on chain-like graphs, shared path prefixes are walked repeatedly, and task creation adds overhead when the iteration space is already known.
+
+\begin{algorithm}[H]
+  \caption{Bor\r{u}vka-intermediate}
+  \label{alg:intermediate}
+  \begin{algorithmic}[1]
+    \Require Weighted graph $G$ in CSR format ($nindex$, $nlist$, $eweight$), $n = |V|$
+    \Ensure Total weight $W$ of the minimum spanning forest
+    \State $W \gets 0$, \; $comps \gets n$
+    \State $parent[u] \gets u$, \; $cheapest[u] \gets \text{INF}$, \; $active[u] \gets \textbf{true}$ for all $u$
+    \Loop
+      \Statex \Comment{Phase 1: cheapest outgoing edge per component (dynamic schedule)}
+      \ParFor{$u \gets 0$ \textbf{to} $n-1$ \textbf{with} $active[u]$}
+        \State $c_u \gets parent[u]$, \; $best \gets \text{INF}$ \Comment{$O(1)$ find: trees are flat}
+        \For{$i \gets nindex[u]$ \textbf{to} $nindex[u+1]-1$}
+          \State $v \gets nlist[i]$
+          \If{$u < v$ \textbf{and} $parent[v] \ne c_u$} \Comment{each undirected edge once}
+            \State $best \gets \min(best,\ \text{Key}(eweight[i], v))$ \Comment{$u$'s side: local minimum}
+            \State $\text{AtomicMin}(cheapest[parent[v]],\ \text{Key}(eweight[i], u))$ \Comment{$v$'s side}
+          \EndIf
+        \EndFor
+        \If{$best \ne \text{INF}$}
+          \State $\text{AtomicMin}(cheapest[c_u],\ best)$
+        \Else
+          \State $active[u] \gets \textbf{false}$
+        \EndIf
+      \EndParFor
+      \Statex \Comment{Phase 2: merge and reset (static schedule, reductions on $W_r$, $m$)}
+      \State $W_r \gets 0$, \; $m \gets 0$
+      \ParFor{$c \gets 0$ \textbf{to} $n-1$}
+        \If{$cheapest[c] \ne \text{INF}$}
+          \State $(w, v) \gets \text{Decode}(cheapest[c])$, \; $cheapest[c] \gets \text{INF}$
+          \If{$\text{DSU.Union}(c, v)$}
+            \State $W_r \gets W_r + w$, \; $m \gets m + 1$
+          \EndIf
+        \EndIf
+      \EndParFor
+      \State $W \gets W + W_r$, \; $comps \gets comps - m$
+      \If{$comps = 1$ \textbf{or} $m = 0$}
+        \State \textbf{break}
+      \EndIf
+      \Statex \Comment{Phase 3: flatten every tree}
+      \ParFor{$u \gets 0$ \textbf{to} $n-1$}
+        \State $parent[u] \gets \text{root of } u$ \Comment{\texttt{compress\_tree()}}
+      \EndParFor
+    \EndLoop
+    \State \Return $W$
+  \end{algorithmic}
+\end{algorithm}
 
 \subsection*{Lock-free Minimum Edge Selection}
 In phase 1, many threads may try to lower the same \texttt{cheapest[c]} slot. Instead of using locks, each candidate edge is packed into one 64-bit key: the upper 32 bits hold the weight and the lower 32 bits hold the edge index (the target vertex in Bor\r{u}vka-intermediate). The sign bit of the weight is flipped so that signed weights keep their order when compared as unsigned integers. Comparing two keys therefore compares the weights first and breaks ties by the lower 32 bits, which makes the selected edge deterministic.
@@ -235,7 +330,7 @@ All results in this report were measured on a laptop (ASUS VivoBook) with an Int
 \end{table}
 
 \subsection*{Evaluation Methodology}
-All implementations, including the baselines, run only on the 8 E-cores, pinned with \texttt{taskset -c 8-15}, so all code runs on identical cores. Each experiment is repeated 9 times and the median runtime is reported. The measured time covers only the MST computation and excludes reading the graph. For unweighted inputs, random weights are assigned with a fixed seed so that every code solves the same instance. Each result is verified against the sequential version, and the verification time is not included in the reported runtime.
+All implementations, including the baselines, run only on the 8 E-cores, pinned with \texttt{taskset -c 8-15}, so all code runs on identical cores. Each experiment is repeated 9 times and the median runtime is reported. The measured time covers only the MST computation and excludes reading the graph. For unweighted inputs, random weights are assigned with a fixed seed so that every code solves the same instance. Each result is verified against the sequential version, and the verification time is not included in the reported runtime. Our measured time includes the allocation and initialization of the DSU and the work arrays. For the baselines we use the times they report themselves: UMinho CPU times only its Bor\r{u}vka loop, after its work arrays are allocated, and Lonestar CPU excludes its initialization, including sorting all edges by weight, and reports whole milliseconds.
 
 \subsection*{Performance Metric}
 We use \textbf{throughput} as the performance metric, defined as
@@ -254,9 +349,9 @@ We report the median of 9 runs because it is not affected by occasional slow run
 \subsection*{Baselines}
 We compare against two parallel CPU codes from the ECL-MST evaluation~\cite{fallin2023eclmst}. Both run unmodified, on the same E-cores and inputs as our code.
 \begin{itemize}
-  \item \textbf{UMinho CPU}~\cite{mariano2015boruvka} -- a generic parallel Borůvka that contracts components into supervertices and builds a new, smaller graph in each round. Built with its OpenMP backend inside an Ubuntu 20.04 container (it needs an older TBB). It reports the MST weight with each edge counted in both directions, so its value is exactly twice ours. 
+  \item \textbf{UMinho CPU}~\cite{mariano2015boruvka} -- a generic parallel Bor\r{u}vka that contracts components into supervertices and builds a new, smaller graph in each round. Built with its OpenMP backend inside an Ubuntu 20.04 container (it needs an older TBB). It reports the MST weight with each edge counted in both directions, so its value is exactly twice ours. 
 
-  \item \textbf{Lonestar CPU (Galois)}~\cite{galois} -- a parallel Borůvka that iterates over components, finds the lightest edge of each component in parallel, and merges components lock-free using a disjoint set. Built inside a container.
+  \item \textbf{Lonestar CPU (Galois)}~\cite{galois} -- a parallel Bor\r{u}vka that iterates over components, finds the lightest edge of each component in parallel, and merges components lock-free using a disjoint set. Built inside a container.
   
 \end{itemize}
 
@@ -296,7 +391,7 @@ We use the 16 input graphs listed in Table~\ref{tab:graphs}, all taken from the 
 
 %----------------------------------------------------------------------
 \section*{Results}
-All parallel results use 8 threads on the E-cores unless stated otherwise, and our parallel codes use a phase-0 chunk size of 20. The Serial column is the sequential version with path halving.
+All parallel results use 8 threads on the E-cores unless stated otherwise. Our parallel codes use dynamic scheduling with chunks of 256 vertices for the edge scan (phase~1) and static scheduling with a chunk size of 20 for the other vertex loops. The Serial column is the sequential version with path halving.
 
 \subsection*{Runtime}
 Table~\ref{tab:runtime} lists the median MST computation time of our implementations and the baselines. It is the raw data from which the throughputs in the following subsections are computed.
@@ -334,7 +429,7 @@ Table~\ref{tab:runtime} lists the median MST computation time of our implementat
   \end{tabular}
 \end{table}
  
- Bor\r{u}vka-intermediate is the fastest code on 10 of the 16 inputs and has the lowest geometric-mean runtime. Its geometric-mean speedup is $4.65\times$ over the serial version, $1.15\times$ over Bor\r{u}vka-omp, $2.16\times$ over UMinho CPU and $1.59\times$ over Lonestar CPU. Bor\r{u}vka-omp is marginally faster on citationCiteseer (0.0189,s vs.\ 0.0192,s). UMinho CPU is the fastest on the two largest road maps, europe\_osm and USA-road-d.USA. Lonestar CPU is the fastest on the three smallest inputs, internet, USA-road-d.NY and rmat16.sym. These inputs take only 4--13,ms, so Lonestar's millisecond timer and its edge sort, which runs outside its timed region, matter a lot there.
+ Bor\r{u}vka-intermediate has the lowest geometric-mean runtime. Its geometric-mean speedup is $4.65\times$ over the serial version, $1.15\times$ over Bor\r{u}vka-omp, $2.16\times$ over UMinho CPU and $1.59\times$ over Lonestar CPU. Bor\r{u}vka-omp is marginally faster on citationCiteseer (0.0189\,s vs.\ 0.0192\,s).
  
 %----------------------------------------------------------------------
 \subsection*{Throughput}
@@ -343,28 +438,22 @@ Figure~\ref{fig:throughput} shows the throughput of all codes on each input, tog
 \begin{figure}[H]
   \centering
   \includegraphics[width=\textwidth]{throughput_8t.png}
-  \caption{Throughput in millions of edges per second (8 threads, log scale), with geometric mean.}
+  \caption{Throughput in millions of edges per second (8 threads), with geometric mean.}
   \label{fig:throughput}
 \end{figure}
  
-Out of the 16 graphs, omp\_intermediate achieves the highest throughput on 10 and omp\_half on 1,
-while Lonestar CPU is the fastest on 3 graphs and UMinho CPU on 2. In one to one comparisons,
-omp\_intermediate beats Lonestar CPU on 13 graphs and UMinho CPU on 12, and omp\_half beats
-Lonestar CPU on 11 graphs and UMinho CPU on 10. Increasing the numberof threads for each of this algoritms results in lower througput values so we are keeping only the througputs reported with 8 threads. 
+Out of the 16 graphs, Bor\r{u}vka-intermediate achieves the highest throughput on 10 and
+Bor\r{u}vka-omp on 1, while Lonestar CPU is the fastest on 3 graphs and UMinho CPU on 2. In
+one-to-one comparisons, Bor\r{u}vka-intermediate beats Lonestar CPU on 13 graphs and UMinho CPU
+on 12, and Bor\r{u}vka-omp beats Lonestar CPU on 11 graphs and UMinho CPU on 10. We report
+throughput at 8 threads, because more threads oversubscribe the 8 E-cores and lower the
+throughput of every code; for Bor\r{u}vka-intermediate the geometric mean falls from
+95.1\,Medges/s at 8 threads to 89.9 at 12 and 90.0 at 16.
 
-The four losses of omp\_intermediate against UMinho CPU are on the sparsest inputs: the three
-road networks (USA-road-d.USA, USA-road-d.NY and europe\_osm) and the internet topology graph,
-all with an average degree of at most 3.1. On such graphs the number of vertices is close to the
-number of edges, and the road networks need 9--12 Bor\r{u}vka rounds compared with 5--7 on the
-power-law graphs. Our merge and flatten phases loop over all vertices in every round, so they
-take most of the runtime on these inputs, whereas UMinho CPU contracts the graph after each
-round and its later rounds operate on far fewer vertices.
-
-The three losses against Lonestar CPU (internet, USA-road-d.NY and rmat16.sym) are instead the
-three smallest inputs, each with fewer than one million edges and a runtime of only 6--13\,ms.
-There, fixed costs dominate: our timed region includes the allocation of the DSU and the work
-arrays and several parallel barriers per round,For measuring the time of lonestar we have excluded the init times outputeed by the lonestar runs. On the large road networks omp\_intermediate
-beats Lonestar CPU ($1.56\times$ on europe\_osm), so these losses depend on input size rather than on graph topology. If the DSU and vector initialization times is are not counted then it might improve the performance of our code but they are designed to be accept the DSU datastructure at the runtime using the generics. 
+Bor\r{u}vka-intermediate loses to UMinho CPU on the three road networks (europe\_osm,
+USA-road-d.USA and USA-road-d.NY) and on internet, and to Lonestar CPU on the three smallest
+inputs (internet, USA-road-d.NY and rmat16.sym). The reasons are discussed in
+Reasoning on Results.
 
 
 %----------------------------------------------------------------------
@@ -400,26 +489,49 @@ $4.28\times$ and UMinho CPU $2.97\times$.
 
 At 8 threads, the best self-speedup is on coPapersDBLP ($6.16\times$) and the worst on the
 sparse inputs: internet ($2.98\times$), USA-road-d.USA ($3.54\times$), USA-road-d.NY
-($3.80\times$) and europe\_osm ($3.81\times$). On these inputs the merge and flatten phases,
-which loop over all vertices in every round, take a large share of the runtime and parallelise
-less well than the edge scan in phase~1.
+($3.80\times$) and europe\_osm ($3.81\times$), the same inputs on which the per-vertex merge
+and flatten phases take the largest share of the runtime (see Reasoning on Results).
  
  
 % %----------------------------------------------------------------------
 \subsection*{Reasoning on Results}
 \begin{itemize}
-    \item \textbf{Path halving}
-        for the parallel boruvka\_omp version  all the benchmarkings are done using the Path halving DSU version. In this version very write to shared parent array is an atomic operation on memory. The Path halving version is chosen because it does the fewest atomic writes and causes the least cache-line traffic between cores. The trees stay shallow after the first rounds anyway, so the weaker compression of path halving costs little.
-        for the boruvka\_omp\_intermediate version we use a diffrent Disjoint set data structure. in this data structure we have readonly find operation which assumes that tree is flattned already and returns the representative in \textit{O(1)} time, we have compress\_tree() function in the Disjoint set data structure which flattens the whole tree. 
-        
-  \item \textbf{Where UMinho CPU is faster.} UMinho CPU contracts the graph after every round: it builds a new, smaller graph that contains only the surviving components and the edges between them. Our code instead keeps the original graph and skips vertices whose neighbours all lie in their own component, 
-  but it still walks an array of size $|V|$ in every round. On the road maps, which have the most vertices per edge and need up to 12 rounds, the shrinking graph lets UMinho CPU do less work in the later rounds, so it is the fastest code on europe\_osm and USA-road-d.USA. On the other inputs, building a new graph every round costs more than it saves, and our code is $2.29\times$ faster on average.
+  \item \textbf{Why Bor\r{u}vka-intermediate is the fastest code.} It does less work per round
+  than Bor\r{u}vka-omp: each undirected edge is scanned once instead of twice, \texttt{find} is a
+  single parent lookup because the trees are flattened after every round, and there is no
+  separate reset pass over all vertices. These savings matter most where the edge scan is cheap
+  relative to the per-vertex work, so the gain over Bor\r{u}vka-omp is largest on the sparse
+  inputs: 48\% on USA-road-d.USA and 59\% on europe\_osm (Table~\ref{tab:runtime}).
 
-  
-  \item \textbf{Where Lonestar CPU is faster.} Lonestar CPU only wins on the two smallest inputs, which take a few milliseconds. Its time excludes the sort of all edges by weight, which it does during initialization, while our time includes all setup. 
+  \item \textbf{Path halving.} In the parallel versions every write to the shared parent array
+  is an atomic operation on memory that other threads read at the same time. Full path
+  compression needs a second pass and rewrites every node on the path, and path splitting also
+  rewrites every node. Path halving rewrites only every other node in a single pass, so it does
+  the fewest atomic writes and causes the least cache-line traffic between cores. The trees stay
+  shallow after the first rounds, so its weaker compression costs little.
 
-  
-  \item \textbf{Load imbalance in phase 1.} Phase 1 is vertex-centric: one thread scans all edges of a vertex. On graphs with high-degree vertices, a thread that gets a hub vertex scans tens of thousands of edges while the other threads wait at the barrier. Dynamic scheduling hands out the vertices in chunks of 256 and keeps this imbalance small, so high-degree inputs still reach the highest throughputs. However, the extra atomic minimum on the second endpoint in Bor\r{u}vka-intermediate concentrates updates on hub components. This is likely why Bor\r{u}vka-intermediate gains little over Bor\r{u}vka-omp on these inputs: 1\% on coPapersDBLP and 3\% on soc-LiveJournal1, compared with 35--38\% on the large road maps (Table~\ref{tab:runtime}).
+  \item \textbf{Where UMinho CPU is faster.} The four losses against UMinho CPU are on the
+  sparsest inputs, all with an average degree of at most 3.1. On such graphs the number of
+  vertices is close to the number of edges, and the road networks need 9--12 Bor\r{u}vka rounds
+  compared with 5--7 on the power-law graphs. Our merge and flatten phases loop over all
+  vertices in every round, so they take 38--44\% of the runtime on these inputs, compared with
+  7--34\% on the other graphs. UMinho CPU instead contracts the graph after every round: it
+  builds a new, smaller graph with only the surviving components, so its later rounds operate
+  on far fewer vertices. On the other 12 inputs, building a new graph every round costs more
+  than it saves, and Bor\r{u}vka-intermediate is $2.99\times$ faster than UMinho CPU on average.
+
+  \item \textbf{Where Lonestar CPU is faster.} The three losses against Lonestar CPU are the
+  three smallest inputs, each with fewer than one million edges and a runtime of only
+  6--13\,ms. There, fixed costs dominate: our timed region includes the allocation of the DSU
+  and the work arrays and several parallel barriers per round, whereas the Lonestar CPU time
+  excludes its initialization, including the edge sort, and its whole-millisecond timer makes
+  these short runs imprecise. On the large road networks Bor\r{u}vka-intermediate beats
+  Lonestar CPU ($1.56\times$ on europe\_osm), so these losses depend on input size rather than
+  on graph topology. Moving the allocation out of the timed region would likely remove part of
+  this gap; we keep it inside because the DSU type is a template parameter that is instantiated
+  inside the timed function.
+
+  \item \textbf{Load imbalance in phase 1.} Phase 1 is vertex-centric: one thread scans all edges of a vertex. On graphs with high-degree vertices, a thread that gets a hub vertex scans tens of thousands of edges while the other threads wait at the barrier. Dynamic scheduling hands out the vertices in chunks of 256 and keeps this imbalance small, so high-degree inputs still reach the highest throughputs. However, the extra atomic minimum on the second endpoint in Bor\r{u}vka-intermediate concentrates updates on hub components. This is likely why Bor\r{u}vka-intermediate gains little over Bor\r{u}vka-omp on these inputs: 0.5\% on coPapersDBLP and 0.4\% on soc-LiveJournal1, and it is even 1.7--1.8\% slower on citationCiteseer and rmat16.sym, compared with its large gains on the road maps.
 
 \end{itemize}
 
