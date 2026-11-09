@@ -1,19 +1,3 @@
-/**
- * 
- * vary the number of threads => (2,4,8,12,16)  -> DONE
- * schedule => (static -> with atleast 3 diffrent size based on cache size, dyanmic -> try with 2-3 chunk size)
- * 
- * Identify where all reduandant work is done, mainly the parallelized loops
- * Test with some baseline published source code, preferabily for multicore CPU
- * Time different phases of the algorithms. -> Done
- * check how many number of iteration of while loop are being done -> DONE
- * 
- * Performace checks for each phase, study access patterns, 
- *
- * 
- * Alex fallin 
- */
-
 #include<bits/stdc++.h>
 #include <omp.h>
 #include "ECLgraph.h"
@@ -79,27 +63,38 @@ static inline unsigned long long edgeKey(int weight, int edge_index){
            static_cast<unsigned int>(edge_index);
 }
 
+
+
+
+
 /**
- * @brief Generates a key for a candidate edge target vertex.
+ * @brief Returns the source vertex of CSR entry i, i.e. the u with
+ * nindex[u] <= i < nindex[u+1].
  *
- * The intermediate implementation scans each undirected edge once and
- * considers it for both endpoint components.  An adjacency-list edge index
- * identifies the target for only one endpoint, so this variant stores the
- * target vertex in the lower 32 bits instead.
+ * Binary search on nindex: O(log V).  upper_bound returns the first offset
+ * greater than i, so the vertex before it owns i.  Zero-degree vertices share
+ * their offset with the next vertex, and upper_bound skips past all of them,
+ * so the result is always the vertex that actually owns entry i.
  */
-static inline unsigned long long edgeTargetKey(int weight, int target){
-    const unsigned int ordered_weight = static_cast<unsigned int>(weight) ^ 0x80000000u;
-    return (static_cast<unsigned long long>(ordered_weight) << 32) |
-           static_cast<unsigned int>(target);
+static inline int edgeSource(const ECLgraph& G, int i){
+    return static_cast<int>(upper_bound(G.nindex, G.nindex + G.nodes + 1, i) - G.nindex) - 1;
 }
 
-// Template function for Boruvka's algorithm, accepting the DSU type
+
+
+
+
+// Template function for Boruvka's algorithm, accepting the DSU type.
+//
+// in_mst must have G.edges entries, all zero.  On return in_mst[i] == 1 for
+// every CSR entry i that is an MST edge.  Each undirected MST edge is marked
+// in only one of its two directions.  The MST weight is not computed here;
+// the caller sums it outside the timed region.
 template <typename DSU_Type>
-long long  Boruvka_CPU(ECLgraph G )  {
+void Boruvka_CPU(const ECLgraph& G, uint8_t* in_mst)  {
     // Instantiate the specified DSU structure
     DSU_Type dsu(G.nodes);
-    
-    long long MST_Weight = 0;
+
     int prev_comps = INT_MAX;
     int curr_comps = G.nodes;
 
@@ -137,24 +132,21 @@ long long  Boruvka_CPU(ECLgraph G )  {
 
             int i = cheapest[u];
             int v = G.nlist[i];
-            int w = G.eweight[i];
 
             if(dsu.G_union(u, v)){
-                MST_Weight+=w;
+                in_mst[i] = 1;
                 curr_comps--;
             }
         }
 
     }
-
-    return MST_Weight;
 }
 
+// Same output contract as Boruvka_CPU: fills in_mst, does not compute weight.
 template <typename DSU_type>
-long long boruvka_omp( ECLgraph G, int chunk_size) {
+void boruvka_omp( const ECLgraph& G, int chunk_size, uint8_t* in_mst) {
     DSU_type dsu(G.nodes);
-    long long MST_Weight = 0;
-    int prev_comps = INT_MAX; 
+    int prev_comps = INT_MAX;
     int curr_comps = G.nodes; 
 
     vector<int> comp(G.nodes);
@@ -170,11 +162,6 @@ long long boruvka_omp( ECLgraph G, int chunk_size) {
         phase_timer.iterations++;
 
         // PHASE_0: flatten component ids and reset cheapest
-        /*
-            cache line is 64bytes and I am storing integers in both comp and cheapes array 
-            hence one cache line can have 64 / 4 -> 16 elements 
-            hence schedule(static,16) would help to reduce the false sharing.....
-        */
         auto start = high_resolution_clock::now();
         #pragma omp parallel for schedule(static,chunk_size)
         for( int u = 0 ; u < G.nodes; u++ ){
@@ -220,45 +207,46 @@ long long boruvka_omp( ECLgraph G, int chunk_size) {
         phase_timer.phase1 += duration<double>(end - start).count();
 
         // PHASE_2: merge comps
-        // Accumulate via reductions instead of atomics on shared counters.
-        long long roundW = 0;
+        // Count merges via a reduction instead of an atomic shared counter.
         int merges = 0;
 
         start = high_resolution_clock::now();
-        #pragma omp parallel for schedule(static, chunk_size) reduction(+:roundW) reduction(+:merges)
+        #pragma omp parallel for schedule(static, chunk_size) reduction(+:merges)
         for( int c = 0 ; c <  G.nodes; c++ ){
             if( cheapest[c] == INF ) continue;
 
             int i = (int)(cheapest[c] & 0xffffffffu);
-            int w = static_cast<int>((cheapest[c] >> 32) ^ 0x80000000u);
             int v = G.nlist[i];
 
+            // No write race on in_mst: edge i starts at a vertex of
+            // component c, so no other c picks the same i.  If two
+            // components pick the two directions of one undirected edge,
+            // only one G_union succeeds, so only one direction is marked.
             if( dsu.G_union(c, v) ) {
-                roundW += w;
+                in_mst[i] = 1;
                 merges++;
             }
         }
         end = high_resolution_clock::now();
         phase_timer.phase2 += duration<double>(end - start).count();
 
-        MST_Weight += roundW;
         curr_comps -= merges;
 
         // One component left (or nothing merged): skip the extra full pass
         // that the prev_comps != curr_comps check would otherwise need.
         if( curr_comps == 1 || merges == 0 ) break;
     }
-
-    return MST_Weight; 
 }
 
 
 
+// Same output contract as Boruvka_CPU: fills in_mst, does not compute weight.
+// Each undirected edge is scanned once, from its smaller endpoint, so the
+// marked entry is always the u < v copy.
 template <typename DSU_type>
-long long  Boruvka_omp_intermediate( ECLgraph G, int chunk_size){
-    DSU_type dsu(G.nodes); 
-    long long MST_Weight = 0 ; 
-    int prev_comps = INT_MAX; 
+void Boruvka_omp_intermediate( const ECLgraph& G, int chunk_size, uint8_t* in_mst){
+    DSU_type dsu(G.nodes);
+    int prev_comps = INT_MAX;
     int curr_comps = G.nodes; 
 
     const unsigned long long INF = ~0ULL;
@@ -305,11 +293,15 @@ long long  Boruvka_omp_intermediate( ECLgraph G, int chunk_size){
                 if( comp_u == comp_v ) continue;
                 has_outgoing = true;
 
-                // Store the opposite endpoint directly.  One adjacency entry
-                // cannot be reused as the candidate for both components,
-                // because G.nlist[i] is the destination only for u's side.
-                best_u = min(best_u, edgeTargetKey(G.eweight[i], v));
-                atomicMinU64(&cheapest[comp_v], edgeTargetKey(G.eweight[i], u));
+                // Both components store the same key (weight, i).  i is the
+                // u -> v entry, so G.nlist[i] is the far endpoint only for
+                // u's side; phase 2 therefore recovers both endpoints from i
+                // instead of using G.nlist[i] as "the other side".  Using
+                // i as the tie-break also gives every component the same
+                // global order on equal-weight edges.
+                const unsigned long long key = edgeKey(G.eweight[i], i);
+                best_u = min(best_u, key);
+                atomicMinU64(&cheapest[comp_v], key);
             }
 
             if( has_outgoing ) atomicMinU64(&cheapest[comp_u], best_u);
@@ -319,30 +311,34 @@ long long  Boruvka_omp_intermediate( ECLgraph G, int chunk_size){
         phase_timer.phase1 += duration<double>(end-start).count();
 
         // PHASE_2: merge comps
-        // Accumulate via reductions instead of atomics on shared counters.
-        long long roundW = 0;
+        // Count merges via a reduction instead of an atomic shared counter.
         int merges = 0;
 
         start = high_resolution_clock::now();
-        #pragma omp parallel for schedule(static, chunk_size) reduction(+:roundW) reduction(+:merges)
+        #pragma omp parallel for schedule(static, chunk_size) reduction(+:merges)
         for( int c = 0 ; c <  G.nodes; c++ ){
             if( cheapest[c] == INF ) continue;
 
             const unsigned long long key = cheapest[c];
             cheapest[c] = INF; // reset for the next round (replaces phase 0)
 
-            int v = (int)(key & 0xffffffffu);
-            int w = static_cast<int>((key >> 32) ^ 0x80000000u);
+            // c may be either endpoint's component, so union the two
+            // endpoints rather than c with G.nlist[i]: for the v side,
+            // G.nlist[i] == v lies inside c and the union would be a no-op.
+            const int i = (int)(key & 0xffffffffu);
+            const int v = G.nlist[i];
+            const int u = edgeSource(G, i);
 
-            if( dsu.G_union(c, v) ) {
-                roundW += w;
+            // No write race on in_mst: when both components picked the same
+            // i, only one G_union(u, v) succeeds, so only one thread writes.
+            if( dsu.G_union(u, v) ) {
+                in_mst[i] = 1;
                 merges++;
             }
         }
         end = high_resolution_clock::now();
         phase_timer.phase2 += duration<double>(end - start).count();
 
-        MST_Weight += roundW;
         curr_comps -= merges;
 
         // One component left (or nothing merged): skip the extra full pass
@@ -356,7 +352,6 @@ long long  Boruvka_omp_intermediate( ECLgraph G, int chunk_size){
         phase_timer.phase3 += duration<double>(end-start).count();
 
     }
-    return MST_Weight; 
 }
 
 
@@ -501,6 +496,27 @@ bool lookup_reference_weight(const fs::path& ref_file, const string& graph, uint
     return false;
 }
 
+/**
+ * @brief Sum the weights of the edges marked in in_mst.
+ *
+ * Used only for verification, outside the timed region.
+ *
+ * @param mst_edges set to the number of marked edges
+ */
+long long mst_weight_from_flags(const ECLgraph& G, const vector<uint8_t>& in_mst, long long& mst_edges) {
+    long long weight = 0;
+    long long count = 0;
+    #pragma omp parallel for reduction(+:weight) reduction(+:count)
+    for (int i = 0; i < G.edges; i++) {
+        if (in_mst[i]) {
+            weight += G.eweight[i];
+            count++;
+        }
+    }
+    mst_edges = count;
+    return weight;
+}
+
 void store_reference_weight(const fs::path& ref_file, const string& graph, uint32_t seed,
                             int nodes, int edges, long long mst_weight) {
     if (ref_file.has_parent_path()) fs::create_directories(ref_file.parent_path());
@@ -635,12 +651,15 @@ int main(int argc, char* argv[]) {
     }
     cout << "--------------------------------------------------\n";
 
-    map<string, function<long long(ECLgraph)>> methods;
-    methods["serial_full"] = [](ECLgraph G){ return (long long)Boruvka_CPU<DSU_full_cpu>(G); };
-    methods["serial_half"] = [](ECLgraph g){ return (long long)Boruvka_CPU<DSU_half_cpu>(g); };
-    methods["serial_split"] = [](ECLgraph g){ return (long long)Boruvka_CPU<DSU_split_cpu>(g); };
-    methods["omp_half"] = [chunk_size](ECLgraph g){ return boruvka_omp<DSU_half_omp>(g, chunk_size); };
-    methods["omp_intermediate"] = [chunk_size](ECLgraph g){ return Boruvka_omp_intermediate<DSU_intermediate_omp>(g, chunk_size); };
+    // Every algorithm marks its MST edges in a flag array (one entry per CSR
+    // entry) and does not compute the weight; see Boruvka_CPU.
+    using MstMethod = function<void(const ECLgraph&, uint8_t*)>;
+    map<string, MstMethod> methods;
+    methods["serial_full"] = [](const ECLgraph& g, uint8_t* in_mst){ Boruvka_CPU<DSU_full_cpu>(g, in_mst); };
+    methods["serial_half"] = [](const ECLgraph& g, uint8_t* in_mst){ Boruvka_CPU<DSU_half_cpu>(g, in_mst); };
+    methods["serial_split"] = [](const ECLgraph& g, uint8_t* in_mst){ Boruvka_CPU<DSU_split_cpu>(g, in_mst); };
+    methods["omp_half"] = [chunk_size](const ECLgraph& g, uint8_t* in_mst){ boruvka_omp<DSU_half_omp>(g, chunk_size, in_mst); };
+    methods["omp_intermediate"] = [chunk_size](const ECLgraph& g, uint8_t* in_mst){ Boruvka_omp_intermediate<DSU_intermediate_omp>(g, chunk_size, in_mst); };
 
     if (methods.find(algo_name) == methods.end()) {
         cerr << "ERROR: Unknown algorithm '" << algo_name << "'\n";
@@ -649,11 +668,19 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    phase_timer.reset_timer(); 
+    // Allocated and zeroed before the timer starts, like UMinho, whose timer
+    // also starts after it allocates selected_edges.
+    vector<uint8_t> in_mst(G.edges, 0);
+
+    phase_timer.reset_timer();
     start = high_resolution_clock::now();
-    long long weight = methods[algo_name](G);
+    methods[algo_name](G, in_mst.data());
     end = high_resolution_clock::now();
     double total_time = duration<double>(end - start).count();
+
+    // Verification starts here, outside the timed region.
+    long long mst_edges = 0;
+    const long long weight = mst_weight_from_flags(G, in_mst, mst_edges);
 
     // Run all available serial implementations as correctness references.
     // Their timings are intentionally not included in total_time because the
@@ -666,12 +693,18 @@ int main(int argc, char* argv[]) {
         cout << "Using cached reference weight from " << ref_weights_file.string() << "\n";
     } else {
         cout << "No cached reference weight, validating with serial_full...\n";
-        serial_full_weight = methods["serial_full"](G);
+        vector<uint8_t> ref_in_mst(G.edges, 0);
+        methods["serial_full"](G, ref_in_mst.data());
+        long long ref_mst_edges = 0;
+        serial_full_weight = mst_weight_from_flags(G, ref_in_mst, ref_mst_edges);
+        cout << "serial_full MST edges: " << ref_mst_edges << "\n";
         store_reference_weight(ref_weights_file, stem, ref_seed, G.nodes, G.edges, serial_full_weight);
     }
 
     const bool results_matched = (weight == serial_full_weight);
 
+    cout << "MST edges marked: " << mst_edges << "\n";
+    cout << "Weight: " << weight << "\n";
     cout << "serial_full weight: " << serial_full_weight << "\n"
          << "Results matched: " << (results_matched ? 1 : 0) << "\n";
 

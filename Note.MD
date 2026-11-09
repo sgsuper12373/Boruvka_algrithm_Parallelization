@@ -128,3 +128,28 @@ OMP_PLACES=cores OMP_PROC_BIND=close taskset -c 8-15 ./scripts/run_uminho_tests.
 - High level draft for cuda implementation. 
 - Check for Theard divergence, memory coleasing, use of shared memory if possible, if using shared mem the bank conflicts 
 - 
+
+
+27-10-2026 
+# numactl is NOT available on Madhava compute nodes
+- Found from madhava_info/madhava_standard_node_info.txt: `numactl: command not found` on the standard nodes.
+- numactl only calls two Linux system calls that do not need root:
+    - sched_setaffinity -> which CPUs the process may run on (like taskset / --physcpubind)
+    - set_mempolicy     -> on which NUMA node memory is allocated (like --membind / --interleave)
+- small replacement: hpc/bench/numapin.c (built by hpc/bench/build.sh on the LOGIN node)
+
+        numapin <cpu-list> <bind0|interleave|none> <command> [args...]
+        numapin 0-3,48-51 bind0      ./a.out ...    # same as numactl --physcpubind=0-3,48-51 --membind=0
+        numapin 0-7,24-31 interleave ./a.out ...    # same as numactl --physcpubind=0-7,24-31 --interleave=all
+
+- Both settings are inherited by the program and all its threads (also UMinho's TBB threads, which OMP_PLACES does not control).
+- Memory policy per set:
+    - set1, set2 (one NUMA node)  -> bind0      : all memory on node 0, same socket as the threads
+    - set3, set4 (both NUMA nodes) -> interleave : pages spread over node 0 and 1, so one socket does not serve all memory traffic
+- numa_balancing = 1 on Madhava (kernel moves pages between nodes by itself). We cannot turn it off without root,
+  but an explicit memory policy (bind / interleave) stops the kernel from migrating those pages.
+- each job writes placement.csv, column policy_seen must be bind:0 (set1/2) or interleave:0-1 (set3/4).
+  Manual check:   hpc/bench/numapin 0,24 interleave awk 'NR==1{print $2; exit}' /proc/self/numa_maps   -> interleave:0-1
+- Other things from the hardware info to mention in the report:
+    - turbo is ON (max 4.0 GHz), governor = performance -> 1 thread runs at a higher clock than all cores, speedups slightly lower
+    - transparent huge pages = always
